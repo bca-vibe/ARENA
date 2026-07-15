@@ -1,4 +1,43 @@
+# %%
+import math
+import os
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
 
+import datasets
+import einops
+import numpy as np
+import torch as t
+import torch.nn as nn
+import wandb
+from jaxtyping import Float, Int
+from rich import print as rprint
+from rich.table import Table
+from torch import Tensor
+from torch.utils.data import DataLoader
+from tqdm.notebook import tqdm
+from transformer_lens import HookedTransformer
+from transformer_lens.utils import gelu_new, tokenize_and_concatenate
+from transformers import GPT2TokenizerFast
+
+device = t.device("mps" if t.backends.mps.is_available() else "cuda" if t.cuda.is_available() else "cpu")
+
+# Make sure exercises are in the path
+chapter = "chapter1_transformer_interp"
+section = "part1_transformer_from_scratch"
+root_dir = next(p for p in Path.cwd().parents if (p / chapter).exists())
+exercises_dir = root_dir / chapter / "exercises"
+section_dir = exercises_dir / section
+if str(exercises_dir) not in sys.path:
+    sys.path.append(str(exercises_dir))
+
+import part1_transformer_from_scratch.solutions as solutions
+import part1_transformer_from_scratch.tests as tests
+
+MAIN = __name__ == "__main__"
 
 # %%
 print(device)
@@ -155,6 +194,93 @@ class Embed(nn.Module):
 tests.test_embed(Embed)
 tests.rand_int_test(Embed, [2, 4])
 tests.load_gpt2_test(Embed, reference_gpt2.embed, tokens)
+
+
+# %%
+class PosEmbed(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.W_pos = nn.Parameter(t.empty((cfg.n_ctx, cfg.d_model)))
+        nn.init.normal_(self.W_pos, std=self.cfg.init_range)
+
+    def forward(self, tokens: Int[Tensor, "batch position"]) -> Float[Tensor, "batch position d_model"]:
+        batch, seq_len = tokens.shape
+        return einops.repeat(self.W_pos[:seq_len], "seq d_model -> batch seq d_model", batch=batch)
+
+
+tests.test_pos_embed(PosEmbed)
+tests.rand_int_test(PosEmbed, [2, 4])
+tests.load_gpt2_test(PosEmbed, reference_gpt2.pos_embed, tokens)
+
+# %%
+device = t.device("mps" if t.backends.mps.is_available() else "cuda" if t.cuda.is_available() else "cpu")
+print(device)
+
+# %%
+class Attention(nn.Module):
+    IGNORE: Float[Tensor, ""]
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.W_Q = nn.Parameter(t.empty((cfg.n_heads, cfg.d_model, cfg.d_head)))
+        self.W_K = nn.Parameter(t.empty((cfg.n_heads, cfg.d_model, cfg.d_head)))
+        self.W_V = nn.Parameter(t.empty((cfg.n_heads, cfg.d_model, cfg.d_head)))
+        self.W_O = nn.Parameter(t.empty((cfg.n_heads, cfg.d_head, cfg.d_model)))
+        self.b_Q = nn.Parameter(t.zeros((cfg.n_heads, cfg.d_head)))
+        self.b_K = nn.Parameter(t.zeros((cfg.n_heads, cfg.d_head)))
+        self.b_V = nn.Parameter(t.zeros((cfg.n_heads, cfg.d_head)))
+        self.b_O = nn.Parameter(t.zeros((cfg.d_model)))
+        nn.init.normal_(self.W_Q, std=self.cfg.init_range)
+        nn.init.normal_(self.W_K, std=self.cfg.init_range)
+        nn.init.normal_(self.W_V, std=self.cfg.init_range)
+        nn.init.normal_(self.W_O, std=self.cfg.init_range)
+        self.register_buffer("IGNORE", t.tensor(float("-inf"), dtype=t.float32, device=device))
+
+    def forward(self, normalized_resid_pre: Float[Tensor, "batch posn d_model"]) -> Float[Tensor, "batch posn d_model"]:
+        # Map the input to the Q, K, V vectors
+        Q = einops.einsum(normalized_resid_pre, self.W_Q, "b p d_model, n_heads d_model d_head -> b p n_heads d_head") + self.b_Q
+        K = einops.einsum(normalized_resid_pre, self.W_K, "b p d_model, n_heads d_model d_head -> b p n_heads d_head") + self.b_K
+        V = einops.einsum(normalized_resid_pre, self.W_V, "b p d_model, n_heads d_model d_head -> b p n_heads d_head") + self.b_V
+        
+        # Compute attention scores (Q K circuit)
+        a_scores = einops.einsum(Q, K, "b p_q n_heads d_head, b p_k n_heads d_head -> b n_heads p_q p_k")
+
+        # Scale them
+        a_scores = a_scores / math.sqrt(self.cfg.d_head)
+
+        # Apply causal masking
+        a_scores = self.apply_causal_mask(a_scores)
+
+        # Softmax to get attention probabilities, representing the full matrix A
+        A = a_scores.softmax(dim = -1)
+
+        # Now the OV circuit, where we use the attention probabilities to map source -> destination
+        # Weighted sum of V
+        Z = einops.einsum(A, V, "b n_heads p_q p_k, b p_k n_heads d_head -> b n_heads p_q d_head")
+
+        # Now sum over all heads and add the output bias
+        return einops.einsum(Z, self.W_O, "b n_heads p d_head, n_heads d_head d_model -> b p d_model") + self.b_O
+
+    def apply_causal_mask(
+        self,
+        attn_scores: Float[Tensor, "batch n_heads query_pos key_pos"],
+    ) -> Float[Tensor, "batch n_heads query_pos key_pos"]:
+        """
+        Applies a causal mask to attention scores, and returns masked scores.
+        """
+        # Get the positions that need to be masked (key pos > query pos)
+        batch, n_heads, query_pos, key_pos = attn_scores.shape
+        mask = t.ones(query_pos, key_pos, device=attn_scores.device, dtype=t.bool).triu(diagonal = 1)
+        # Mask the scores at these positions
+        attn_scores.masked_fill_(mask, self.IGNORE)
+        return attn_scores
+
+
+tests.test_causal_mask(Attention.apply_causal_mask)
+tests.rand_float_test(Attention, [2, 4, 768])
+tests.load_gpt2_test(Attention, reference_gpt2.blocks[0].attn, cache["normalized", 0, "ln1"])
 
 
 # %%
