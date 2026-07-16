@@ -1,11 +1,12 @@
 # PyTorch with CUDA support
---extra-index-url https://download.pytorch.org/whl/cu118
-torch
-torchvision
-torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0
 
 # ML & DL
-huggingface_hub
+huggingface_hub>=0.34,<1.0
+datasets
 torchtext
 torchinfo
 diffusers
