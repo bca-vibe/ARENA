@@ -82,6 +82,7 @@ maika_text = "The Westgate is an exquisitely high end chain of fancy schmancy ho
 gpt2_small(maika_text)
 
 logits: Tensor = gpt2_small(maika_text, return_type="logits")
+print(logits.argmax(dim=-1).squeeze().shape)
 prediction = logits.argmax(dim=-1).squeeze()[:-1]
 print(prediction)
 
@@ -100,7 +101,8 @@ print(f"Correct tokens: {gpt2_small.to_str_tokens(prediction[is_correct])}")
 gpt2_text = "Natural language processing tasks, such as question answering, machine translation, reading comprehension, and summarization, are typically approached with supervised learning on task-specific datasets."
 gpt2_tokens = gpt2_small.to_tokens(gpt2_text)
 gpt2_logits, gpt2_cache = gpt2_small.run_with_cache(gpt2_tokens, remove_batch_dim=True)
-
+print(gpt2_logits.shape)
+print(gpt2_cache['blocks.0.attn.hook_q'].shape)
 print(type(gpt2_logits), type(gpt2_cache))
 
 # %%
@@ -117,6 +119,7 @@ q, k = gpt2_cache["q", 0], gpt2_cache["k", 0]
 seq, n_head, d_head = q.shape
 layer0_attn_scores = einops.einsum(q, k, "seqQ n h, seqK n h -> n seqQ seqK")
 mask = t.triu(t.ones((seq, seq), dtype=t.bool), diagonal=1).to(device)
+print(mask)
 layer0_attn_scores.masked_fill_(mask, -1e9)
 layer0_pattern_from_q_and_k = (layer0_attn_scores / math.sqrt(d_head)).softmax(-1)
 t.testing.assert_close(layer0_pattern_from_cache, layer0_pattern_from_q_and_k)
@@ -138,6 +141,8 @@ display(
 )
 # L0H7 looks like a previous token head!
 
+# %%
+gpt2_cache["post", 0].shape
 # %%
 neuron_activations_for_all_layers = t.stack([
     gpt2_cache["post", layer] for layer in range(gpt2_small.cfg.n_layers)
@@ -195,14 +200,12 @@ for layer in range(model.cfg.n_layers):
 # Head 07 looks like a previous token attention head
 # Head03 is looking at first token, as is Head14 (mostly)
 # Head 011 is mostly a same token head
+# Head 110 looks most strongly like an induction head
 
 
 # %% 
 cache["pattern", 0].shape
-cache["pattern", 0]
 
-# %%
-cache
 # %%
 def current_attn_detector(cache: ActivationCache) -> list[str]:
     """
@@ -313,6 +316,7 @@ batch_size = 1
 (rep_tokens, rep_logits, rep_cache) = run_and_cache_model_repeated_tokens(model, seq_len, batch_size)
 rep_cache.remove_batch_dim()
 rep_str = model.to_str_tokens(rep_tokens)
+print(rep_str)
 model.reset_hooks()
 log_probs = get_log_probs(rep_logits, rep_tokens).squeeze()
 
@@ -324,7 +328,7 @@ plot_loss_difference(log_probs, rep_str, seq_len)
 # %%
 for layer in range(model.cfg.n_layers):
     # Capture the attention scores
-    attention_pattern = cache["pattern", layer]
+    attention_pattern = rep_cache["pattern", layer]
     # Display them
     display(cv.attention.attention_patterns(tokens=rep_str, attention=attention_pattern))
 
@@ -410,9 +414,6 @@ def visualize_pattern_hook(
 ):
     print("Layer: ", hook.layer())
     display(cv.attention.attention_patterns(tokens=gpt2_small.to_str_tokens(rep_tokens[0]), attention=pattern.mean(0)))
-
-
-# YOUR CODE HERE - find induction heads in gpt2_small
 
 # Run with hooks (this is where we write to the `induction_score_store` tensor`)
 gpt2_small.run_with_hooks(
@@ -783,5 +784,288 @@ abl_c, abl_w = get_induction_attn_at_ambig(tokens, fwd_hooks=[(
 
 print(f"clean:      attn to correct src {clean_c:.3f} | confusable src {clean_w:.3f}")
 print(f"H4 ablated: attn to correct src {abl_c:.3f} | confusable src {abl_w:.3f}")
+
+# %%
+# Factored matrices!
+A = t.randn(5, 2)
+B = t.randn(2, 5)
+AB = A @ B
+AB_factor = FactoredMatrix(A, B)
+print(AB)
+print(AB_factor)
+print("Norms:")
+print(AB.norm())
+print(AB_factor.norm())
+
+print(f"Right dim: {AB_factor.rdim}, Left dim: {AB_factor.ldim}, Hidden dim: {AB_factor.mdim}")
+
+# %%
+print("Eigenvalues:")
+print(t.linalg.eig(AB).eigenvalues)
+print(AB_factor.eigenvalues)
+
+print("\nSingular Values:")
+print(t.linalg.svd(AB).S)
+print(AB_factor.S)
+
+print("\nFull SVD:")
+print(AB_factor.svd())
+
+# %%
+C = t.randn(5, 300)
+ABC = AB @ C
+ABC_factor = AB_factor @ C
+
+print(f"Unfactored: shape={ABC.shape}, norm={ABC.norm()}")
+print(f"Factored: shape={ABC_factor.shape}, norm={ABC_factor.norm()}")
+print(f"\nRight dim: {ABC_factor.rdim}, Left dim: {ABC_factor.ldim}, Hidden dim: {ABC_factor.mdim}")
+
+
+# %%
+for name, param in model.named_parameters():
+    print(name, param.shape)
+
+# %%
+head_index = 4
+layer = 1
+W_E = model.embed.W_E
+W_O = model.blocks[layer].attn.W_O[head_index]
+W_V = model.blocks[layer].attn.W_V[head_index]
+W_U = model.unembed.W_U
+
+W_OV = FactoredMatrix(W_V, W_O)
+full_OV_circuit = W_E @ W_OV @ W_U
+
+tests.test_full_OV_circuit(full_OV_circuit, model, layer, head_index)
+# %%
+# Check to see if this looks like a diagonal matrix on a subset of rows!
+indices = t.randint(0, model.cfg.d_vocab, (200,))
+full_OV_circuit_sample = full_OV_circuit[indices, indices].AB
+
+imshow(
+    full_OV_circuit_sample,
+    labels={"x": "Logits on output token", "y": "Input token"},
+    title="Full OV circuit for copying head",
+    width=700,
+    height=600,
+)
+
+# %%
+def top_1_acc(full_OV_circuit: FactoredMatrix, batch_size: int = 1000) -> float:
+    """
+    Return the fraction of the time that the maximum value is on the circuit diagonal.
+    """
+    total = 0
+
+    for indices in t.split(t.arange(full_OV_circuit.shape[0], device=device), batch_size):
+        AB_slice = full_OV_circuit[indices].AB
+        total += (t.argmax(AB_slice, dim=1) == indices).float().sum().item()
+
+    return total / full_OV_circuit.shape[0]
+
+
+print(f"Fraction of time that the best logit is on diagonal: {top_1_acc(full_OV_circuit):.4f}")
+
+# %%
+# Compute the effective OV circuit, which also includes the other induction head L1H10
+W_O_both = einops.rearrange(model.W_O[1, [4, 10]], "head d_head d_model -> (head d_head) d_model")
+W_V_both = einops.rearrange(model.W_V[1, [4, 10]], "head d_model d_head -> d_model (head d_head)")
+
+W_OV_eff = W_E @ FactoredMatrix(W_V_both, W_O_both) @ W_U
+
+print(f"Fraction of the time that the best logit is on the diagonal: {top_1_acc(W_OV_eff):.4f}")
+
+
+# %%
+layer = 0
+head_index = 7
+
+# Compute full QK matrix (for positional embeddings)
+W_pos = model.W_pos
+W_QK = model.W_Q[layer, head_index] @ model.W_K[layer, head_index].T
+pos_by_pos_scores = W_pos @ W_QK @ W_pos.T
+
+# Mask, scale and softmax the scores
+mask = t.tril(t.ones_like(pos_by_pos_scores)).bool()
+pos_by_pos_pattern = t.where(mask, pos_by_pos_scores / model.cfg.d_head**0.5, -1.0e6).softmax(-1)
+
+# Plot the results
+print(f"Avg lower-diagonal value: {pos_by_pos_pattern.diag(-1).mean():.4f}")
+imshow(
+    utils.to_numpy(pos_by_pos_pattern[:200, :200]),
+    labels={"x": "Key", "y": "Query"},
+    title="Attention patterns for prev-token QK circuit, first 100 indices",
+    width=700,
+    height=600,
+)
+
+# %%
+print(cache['hook_embed'].shape)
+
+# %%
+def decompose_qk_input(cache: ActivationCache) -> Float[Tensor, "n_heads+2 posn d_model"]:
+    """
+    Retrieves all the input tensors to the first attention layer, and concatenates them along the
+    0th dim.
+
+    The [i, :, :]th element is y_i (from notation above). The sum of these tensors along the 0th
+    dim should be the input to the first attention layer.
+    """
+    y0 = cache["embed"].unsqueeze(0)  # shape (1, seq, d_model)
+    y1 = cache["pos_embed"].unsqueeze(0)  # shape (1, seq, d_model)
+    y_rest = cache["result", 0].transpose(0, 1)  # shape (12, seq, d_model)
+
+    return t.concat([y0, y1, y_rest], dim=0)
+
+
+def decompose_q(
+    decomposed_qk_input: Float[Tensor, "n_heads+2 posn d_model"],
+    ind_head_index: int,
+    model: HookedTransformer,
+) -> Float[Tensor, "n_heads+2 posn d_head"]:
+    """
+    Computes the tensor of query vectors for each decomposed QK input.
+
+    The [i, :, :]th element is y_i @ W_Q (so the sum along axis 0 is just the q-values).
+    """
+    W_Q = model.W_Q[1, ind_head_index]
+
+    return einops.einsum(decomposed_qk_input, W_Q, "n seq d_model, d_model d_head -> n seq d_head")
+
+
+def decompose_k(
+    decomposed_qk_input: Float[Tensor, "n_heads+2 posn d_model"],
+    ind_head_index: int,
+    model: HookedTransformer,
+) -> Float[Tensor, "n_heads+2 posn d_head"]:
+    """
+    Computes the tensor of key vectors for each decomposed QK input.
+
+    The [i, :, :]th element is y_i @ W_K(so the sum along axis 0 is just the k-values)
+    """
+    W_K = model.W_K[1, ind_head_index]
+
+    return einops.einsum(decomposed_qk_input, W_K, "n seq d_model, d_model d_head -> n seq d_head")
+
+
+# Recompute rep tokens/logits/cache, if we haven't already
+seq_len = 50
+batch_size = 1
+(rep_tokens, rep_logits, rep_cache) = run_and_cache_model_repeated_tokens(model, seq_len, batch_size)
+rep_cache.remove_batch_dim()
+
+ind_head_index = 4
+
+# First we get decomposed q and k input, and check they're what we expect
+decomposed_qk_input = decompose_qk_input(rep_cache)
+decomposed_q = decompose_q(decomposed_qk_input, ind_head_index, model)
+decomposed_k = decompose_k(decomposed_qk_input, ind_head_index, model)
+t.testing.assert_close(
+    decomposed_qk_input.sum(0),
+    rep_cache["resid_pre", 1] + rep_cache["pos_embed"],
+    rtol=0.01,
+    atol=1e-05,
+)
+t.testing.assert_close(decomposed_q.sum(0), rep_cache["q", 1][:, ind_head_index], rtol=0.01, atol=0.001)
+t.testing.assert_close(decomposed_k.sum(0), rep_cache["k", 1][:, ind_head_index], rtol=0.01, atol=0.01)
+
+# Second, we plot our results
+component_labels = ["Embed", "PosEmbed"] + [f"0.{h}" for h in range(model.cfg.n_heads)]
+for decomposed_input, name in [(decomposed_q, "query"), (decomposed_k, "key")]:
+    imshow(
+        utils.to_numpy(decomposed_input.pow(2).sum([-1])),
+        labels={"x": "Position", "y": "Component"},
+        title=f"Norms of components of {name}",
+        y=component_labels,
+        width=800,
+        height=400,
+    )
+
+# %%
+def decompose_attn_scores(
+    decomposed_q: Float[Tensor, "q_comp q_pos d_head"],
+    decomposed_k: Float[Tensor, "k_comp k_pos d_head"],
+    model: HookedTransformer,
+) -> Float[Tensor, "q_comp k_comp q_pos k_pos"]:
+    """
+    Output is decomposed_scores with shape [query_component, key_component, query_pos, key_pos]
+
+    The [i, j, 0, 0]th element is y_i @ W_QK @ y_j^T (so the sum along both first axes are the
+    attention scores)
+    """
+    return einops.einsum(decomposed_q, decomposed_k, "q_comp q_pos d_head, k_comp k_pos d_head -> q_comp k_comp q_pos k_pos") / (model.cfg.d_head**0.5)
+
+
+tests.test_decompose_attn_scores(decompose_attn_scores, decomposed_q, decomposed_k, model)
+
+# %%
+# First plot: attention score contribution from (query_component, key_component) = (Embed, L0H7), you can replace this
+# with any other pair and see that the values are generally much smaller, i.e. this pair dominates the attention score
+# calculation
+decomposed_scores = decompose_attn_scores(decomposed_q, decomposed_k, model)
+
+q_label = "Embed"
+k_label = "0.7"
+decomposed_scores_from_pair = decomposed_scores[component_labels.index(q_label), component_labels.index(k_label)]
+
+imshow(
+    utils.to_numpy(t.tril(decomposed_scores_from_pair)),
+    title=f"Attention score contributions from query = {q_label}, key = {k_label}<br>(by query & key sequence positions)",
+    width=700,
+)
+
+
+# Second plot: std dev over query and key positions, shown by component. This shows us that the other pairs of
+# (query_component, key_component) are much less important, without us having to look at each one individually like we
+# did in the first plot!
+decomposed_stds = einops.reduce(
+    decomposed_scores, "query_decomp key_decomp query_pos key_pos -> query_decomp key_decomp", t.std
+)
+imshow(
+    utils.to_numpy(decomposed_stds),
+    labels={"x": "Key Component", "y": "Query Component"},
+    title="Std dev of attn score contributions across sequence positions<br>(by query & key comp)",
+    x=component_labels,
+    y=component_labels,
+    width=700,
+)
+
+# %%
+def find_K_comp_full_circuit(
+    model: HookedTransformer, prev_token_head_index: int, ind_head_index: int
+) -> FactoredMatrix:
+    """
+    Returns a (vocab, vocab)-size FactoredMatrix, with the first dimension being the query side
+    (direct from token embeddings) and the second dimension being the key side (going via the
+    previous token head).
+    """
+    W_E = model.W_E
+    W_Q = model.W_Q[1, ind_head_index]
+    W_K = model.W_K[1, ind_head_index]
+    W_O = model.W_O[0, prev_token_head_index]
+    W_V = model.W_V[0, prev_token_head_index]
+
+    Q = W_E @ W_Q
+    K = W_E @ W_V @ W_O @ W_K
+    return FactoredMatrix(Q, K.T)
+
+
+prev_token_head_index = 7
+ind_head_index = 4
+K_comp_circuit = find_K_comp_full_circuit(model, prev_token_head_index, ind_head_index)
+
+tests.test_find_K_comp_full_circuit(find_K_comp_full_circuit, model)
+
+print(f"Token frac where max-activating key = same token: {top_1_acc(K_comp_circuit.T):.4f}")
+
+# %%
+prev_token_head_index = 7
+ind_head_index = 10
+K_comp_circuit = find_K_comp_full_circuit(model, prev_token_head_index, ind_head_index)
+
+tests.test_find_K_comp_full_circuit(find_K_comp_full_circuit, model)
+
+print(f"Token frac where max-activating key = same token: {top_1_acc(K_comp_circuit.T):.4f}")
+
 
 # %%
