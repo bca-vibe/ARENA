@@ -1059,13 +1059,197 @@ tests.test_find_K_comp_full_circuit(find_K_comp_full_circuit, model)
 print(f"Token frac where max-activating key = same token: {top_1_acc(K_comp_circuit.T):.4f}")
 
 # %%
+# First plot: attention score contribution from (query_component, key_component) = (Embed, L0H7), you can replace this
+# with any other pair and see that the values are generally much smaller, i.e. this pair dominates the attention score
+# calculation
+decomposed_scores = decompose_attn_scores(decomposed_q, decomposed_k, model)
+
+q_label = "Embed"
+k_label = "0.7"
+decomposed_scores_from_pair = decomposed_scores[component_labels.index(q_label), component_labels.index(k_label)]
+
+imshow(
+    utils.to_numpy(t.tril(decomposed_scores_from_pair)),
+    title=f"Attention score contributions from query = {q_label}, key = {k_label}<br>(by query & key sequence positions)",
+    width=700,
+)
+
+
+# Second plot: std dev over query and key positions, shown by component. This shows us that the other pairs of
+# (query_component, key_component) are much less important, without us having to look at each one individually like we
+# did in the first plot!
+decomposed_stds = einops.reduce(
+    decomposed_scores, "query_decomp key_decomp query_pos key_pos -> query_decomp key_decomp", t.std
+)
+imshow(
+    utils.to_numpy(decomposed_stds),
+    labels={"x": "Key Component", "y": "Query Component"},
+    title="Std dev of attn score contributions across sequence positions<br>(by query & key comp)",
+    x=component_labels,
+    y=component_labels,
+    width=700,
+)
+
+
+# %%
+def find_K_comp_full_circuit(
+    model: HookedTransformer, prev_token_head_index: int, ind_head_index: int
+) -> FactoredMatrix:
+    """
+    Returns a (vocab, vocab)-size FactoredMatrix, with the first dimension being the query side
+    (direct from token embeddings) and the second dimension being the key side (going via the
+    previous token head).
+    """
+    W_E = model.W_E
+    W_Q = model.W_Q[1, ind_head_index]
+    W_K = model.W_K[1, ind_head_index]
+    W_O = model.W_O[0, prev_token_head_index]
+    W_V = model.W_V[0, prev_token_head_index]
+
+    Q = W_E @ W_Q
+    K = W_E @ W_V @ W_O @ W_K
+    return FactoredMatrix(Q, K.T)
+
+
 prev_token_head_index = 7
-ind_head_index = 10
+ind_head_index = 4
 K_comp_circuit = find_K_comp_full_circuit(model, prev_token_head_index, ind_head_index)
 
 tests.test_find_K_comp_full_circuit(find_K_comp_full_circuit, model)
 
 print(f"Token frac where max-activating key = same token: {top_1_acc(K_comp_circuit.T):.4f}")
 
+
+
+# %%
+import matplotlib.pyplot as plt
+
+def pairwise_dot_products(n: int, d: int, device: str = "cuda") -> t.Tensor:
+    """Sample n random vectors of dimension d (standard normal entries),
+    return a 1D tensor of dot products for all n*(n-1)/2 distinct pairs."""
+    X = t.randn(n, d, device=device)
+    dots = X @ X.T                      # (n, n) matrix of all pairwise dots
+    idx = t.triu_indices(n, n, offset=1)   # upper triangle, excluding diagonal
+    return dots[idx[0], idx[1]]
+
+n, d = 500, 500
+dots = pairwise_dot_products(n, d)
+
+print(f"Number of pairs: {dots.numel()}")           # 500*499/2 = 124,750
+print(f"Average dot product: {dots.mean().item():.4f}")
+print(f"Std of dot products: {dots.std().item():.4f}")
+
+plt.hist(dots.cpu().numpy(), bins=100, density=True)
+plt.xlabel("Dot product")
+plt.ylabel("Density")
+plt.title(f"Pairwise dot products, n={n}, d={d}")
+plt.show()
+# %%
+def get_comp_score(W_A: Float[Tensor, "in_A out_A"], W_B: Float[Tensor, "out_A out_B"]) -> float:
+    """
+    Return the composition score between W_A and W_B.
+    """
+    W_A_norm = W_A.pow(2).sum().sqrt()
+    W_B_norm = W_B.pow(2).sum().sqrt()
+    W_AB_norm = (W_A @ W_B).pow(2).sum().sqrt()
+
+    return (W_AB_norm / (W_A_norm * W_B_norm)).item()
+
+
+tests.test_get_comp_score(get_comp_score)
+
+# %%
+# Get all QK and OV matrices
+W_QK = model.W_Q @ model.W_K.transpose(-1, -2)
+W_OV = model.W_V @ model.W_O
+
+# Define tensors to hold the composition scores
+composition_scores = {
+    "Q": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+    "K": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+    "V": t.zeros(model.cfg.n_heads, model.cfg.n_heads).to(device),
+}
+
+for i in tqdm(range(model.cfg.n_heads)):
+    for j in range(model.cfg.n_heads):
+        composition_scores["Q"][i, j] = get_comp_score(W_OV[0, i], W_QK[1, j])
+        composition_scores["K"][i, j] = get_comp_score(W_OV[0, i], W_QK[1, j].T)
+        composition_scores["V"][i, j] = get_comp_score(W_OV[0, i], W_OV[1, j])
+# Plot the composition scores
+for comp_type in ["Q", "K", "V"]:
+    plot_comp_scores(model, composition_scores[comp_type], f"{comp_type} Composition Scores")
+
+# %%
+def generate_single_random_comp_score() -> float:
+    """
+    Write a function which generates a single composition score for random matrices
+    """
+    W_A_left = t.empty(model.cfg.d_model, model.cfg.d_head)
+    W_B_left = t.empty(model.cfg.d_model, model.cfg.d_head)
+    W_A_right = t.empty(model.cfg.d_model, model.cfg.d_head)
+    W_B_right = t.empty(model.cfg.d_model, model.cfg.d_head)
+
+    for W in [W_A_left, W_B_left, W_A_right, W_B_right]:
+        nn.init.kaiming_uniform_(W, a=np.sqrt(5))
+
+    W_A = W_A_left @ W_A_right.T
+    W_B = W_B_left @ W_B_right.T
+
+    return get_comp_score(W_A, W_B)
+
+n_samples = 300
+comp_scores_baseline = np.zeros(n_samples)
+for i in tqdm(range(n_samples)):
+    comp_scores_baseline[i] = generate_single_random_comp_score()
+
+print("\nMean:", comp_scores_baseline.mean())
+print("Std:", comp_scores_baseline.std())
+
+hist(
+    comp_scores_baseline,
+    nbins=50,
+    width=800,
+    labels={"x": "Composition score"},
+    title="Random composition scores",
+)
+# %%
+baseline = comp_scores_baseline.mean()
+for comp_type, comp_scores in composition_scores.items():
+    plot_comp_scores(model, comp_scores, f"{comp_type} Composition Scores", baseline=baseline)
+
+# %%
+seq_len = 50
+
+
+def ablation_induction_score(prev_head_index: int | None, ind_head_index: int) -> float:
+    """
+    Takes as input the index of the L0 head and the index of the L1 head, and then runs with the
+    previous token head ablated and returns the induction score for the ind_head_index now.
+    """
+
+    def ablation_hook(v, hook):
+        if prev_head_index is not None:
+            v[:, :, prev_head_index] = 0.0
+        return v
+
+    def induction_pattern_hook(attn, hook):
+        hook.ctx[prev_head_index] = attn[0, ind_head_index].diag(-(seq_len - 1)).mean()
+
+    model.run_with_hooks(
+        rep_tokens,
+        fwd_hooks=[
+            (utils.get_act_name("v", 0), ablation_hook),
+            (utils.get_act_name("pattern", 1), induction_pattern_hook),
+        ],
+    )
+    return model.blocks[1].attn.hook_pattern.ctx[prev_head_index].item()
+
+
+baseline_induction_score = ablation_induction_score(None, 4)
+print(f"Induction score for no ablations: {baseline_induction_score:.5f}\n")
+for i in range(model.cfg.n_heads):
+    new_induction_score = ablation_induction_score(i, 4)
+    induction_score_change = new_induction_score - baseline_induction_score
+    print(f"Ablation score change for head {i:02}: {induction_score_change:+.5f}")
 
 # %%
